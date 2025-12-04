@@ -1,0 +1,15 @@
+.venv/
+.venv311/
+__pycache__/
+.vscode/
+.DS_Store
+domain_terms_auto.json
+
+# Temporary audio files
+_tmp_*.wav
+*.wav
+
+
+# Subtitle and text files
+*.srt
+*.txt
