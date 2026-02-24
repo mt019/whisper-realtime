@@ -1087,6 +1087,7 @@ def transcribe_one(
     total_sec_for_progress: float | None = None,
     lexical_rules: LexicalRules | None = None,
     punc_settings: PunctuationSettings | None = None,
+    progress_label: str = "分段處理中…",
 ):
     """單段轉錄，SRT 無標點，即時顯示為原始小句，最終整合使用 SmartPunctuator 補標點。"""
     live_box = ui_area.empty()
@@ -1095,7 +1096,7 @@ def transcribe_one(
     srt_lines, idx = [], 1
     t0 = time.time()
     processed_sec = 0.0
-    prog = progress_area.progress(0.0, text="分段處理中…")
+    prog = progress_area.progress(0.0, text=progress_label)
     total_sec = total_sec_for_progress or 1.0
     lexical_cfg = lexical_rules or LEXICAL_RULES
     punctuation_cfg = punc_settings or CURRENT_PUNCT_SETTINGS
@@ -1266,20 +1267,6 @@ if not IS_WORKER:
         # 設定上傳狀態
         st.session_state['file_uploaded'] = True
 
-        # 加入防誤關閉提示
-        st.components.v1.html(
-            """
-            <script>
-            if (!window.hasUploadWarning) {
-                window.onbeforeunload = function(e) {
-                    return '轉寫尚未完成，確定要離開嗎？';
-                };
-                window.hasUploadWarning = true;
-            }
-            </script>
-            """,
-            height=0,
-        )
 
     # 顯示/下載區
     status = st.empty()
@@ -1291,6 +1278,28 @@ if not IS_WORKER:
 
     # 初始化狀態
     transcribing = st.session_state.get("transcribing", False)
+
+    # 加入防誤關閉提示（以 markdown 注入 script，避免 iframe 佔位；無論轉寫狀態皆啟用）
+    st.markdown(
+        """
+        <script>
+        (function() {
+            const msg = '轉寫尚未完成，確定要離開嗎？';
+            const w = window.parent || window;
+            if (!w.__whispertc_onbeforeunload) {
+                const handler = function(e) {
+                    e.preventDefault();
+                    e.returnValue = msg;
+                    return msg;
+                };
+                w.__whispertc_onbeforeunload = handler;
+                w.onbeforeunload = handler;
+            }
+        })();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
 
     # 顯示灰化樣式 + 禁用游標
     st.markdown(
@@ -1319,6 +1328,9 @@ if not IS_WORKER:
 
     if transcribing:
         st.caption("🔒 轉錄進行中，暫時無法切換顯示模式。")
+
+    # 讓即時進度條固定在顯示模式切換的下方
+    realtime_progress_area = st.empty()
 
     # === 顯示結果區 ===
     final_box = st.empty()
@@ -1464,8 +1476,8 @@ if not IS_WORKER and st.session_state.get("start_transcribe_pending"):
         with st.container():
             st.subheader("轉寫進度")
             one_live = st.empty()
-            one_prog = st.empty()
             one_stats = st.empty()
+        progress_area = realtime_progress_area
         seg_start_ts = time.strftime("%Y-%m-%d %H:%M:%S")
         st.caption(f"分段 1 開始轉換時間點：{seg_start_ts}")
         status.info("開始轉寫…")
@@ -1475,10 +1487,11 @@ if not IS_WORKER and st.session_state.get("start_transcribe_pending"):
             language="zh", vad_filter=vad, beam_size=beam_size,
             initial_prompt=combined_prompt, punc_rule=punc_rule,
             vad_parameters=vad_params,
-            ui_area=one_live, progress_area=one_prog, stats_area=one_stats,
+            ui_area=one_live, progress_area=progress_area, stats_area=one_stats,
             time_offset_sec=chunks[0][0], total_sec_for_progress=(chunks[0][1]-chunks[0][0]),
             lexical_rules=LEXICAL_RULES,
             punc_settings=CURRENT_PUNCT_SETTINGS,
+            progress_label="轉寫中…",
         )
         total_elapsed = elapsed
         final_texts.append(final_text)
