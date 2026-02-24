@@ -74,3 +74,8 @@ ffmpeg -i "/Users/iw/Documents/NTU/1141/whisper/whisper-rt-full/whisper-realtime
 
 
 ffmpeg -i "/Users/iw/Documents/NTU/1141/whisper/whisper-rt-full/whisper-realtime/台大法學院 32.m4a" -ac 1 -b:a 64k -ar 16000 "/Users/iw/Documents/NTU/1141/whisper/whisper-rt-full/whisper-realtime/台大法學院 32-whisper.m4a"
+
+
+2026.02.24
+
+1. 修復「關閉分頁/重整」防誤關閉提示在 Chrome 本機無效的問題：改用 `components.v1.html` 注入 `beforeunload`，並加上定時重掛載，轉寫中啟用、結束後解除。

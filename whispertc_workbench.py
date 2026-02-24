@@ -368,10 +368,10 @@ if not IS_WORKER:
         }
         </style>
         <style>
-        [data-testid="stFileUploaderDropzone"] {
-            min-height: 12rem !important;  /* default is ~6rem, double it */
+        [data-testid="stFileUploaderDropzone"][aria-label*="上傳音檔"] {
+            min-height: 30rem !important;  /* default is ~6rem, double it */
         }
-        [data-testid="stFileUploaderDropzone"] section {
+        [data-testid="stFileUploaderDropzone"][aria-label*="上傳音檔"] section {
             padding: 2rem !important;      /* increase padding inside dropzone */
         }
         </style>
@@ -1133,6 +1133,7 @@ def transcribe_one(
         raw_text = normalize_zh_punc(cc.convert(seg.text)).strip()
         if not raw_text:
             continue
+        corrected_text = apply_common_corrections(raw_text)
         acc.append(raw_text)
         prev_end = seg.end or prev_end
 
@@ -1141,7 +1142,7 @@ def transcribe_one(
         adj_end = (seg.end or 0.0) + time_offset_sec
         srt_lines.append(f"{idx}")
         srt_lines.append(f"{start_timecode(adj_start)} --> {start_timecode(adj_end)}")
-        srt_lines.append(apply_common_corrections(raw_text))  # 無標點
+        srt_lines.append(corrected_text)  # 無標點
         srt_lines.append("")
         idx += 1
 
@@ -1163,7 +1164,7 @@ def transcribe_one(
             if txt_path and srt_path:
                 # Write to TXT
                 with open(txt_path, "a", encoding="utf-8") as f_txt:
-                    f_txt.write(raw_text + "\n")
+                    f_txt.write(corrected_text + "\n")
                 # Write full SRT block
                 with open(srt_path, "a", encoding="utf-8") as f_srt:
                     f_srt.write(
@@ -1260,7 +1261,58 @@ if not IS_WORKER:
     # ==== 輸入 ====
     uploaded = None
     uploaded_name = None
-    uploaded = st.file_uploader("上傳音檔", type=["m4a","mp3","wav","flac"])
+    uploaded = st.file_uploader("上傳音檔", type=["m4a","mp3","wav","flac"], key="main_audio_uploader")
+    st.markdown(
+        """
+        <style>
+        /* 只放大「上傳音檔」區塊，不影響其他 uploader */
+        section[data-testid="stFileUploaderDropzone"][aria-label*="上傳音檔"] {
+            min-height: 30rem !important;
+        }
+        </style>
+        <script>
+        (function() {
+            const w = window.parent || window;
+            if (w.__whispertc_global_drop_bound) return;
+
+            function findMainAudioInput() {
+                const sections = Array.from(w.document.querySelectorAll('section[data-testid="stFileUploaderDropzone"]'));
+                for (const sec of sections) {
+                    const aria = (sec.getAttribute('aria-label') || '');
+                    if (!aria.includes('上傳音檔')) continue;
+                    const input = sec.querySelector('input[type="file"][data-testid="stFileUploaderDropzoneInput"]');
+                    if (input) return input;
+                }
+                return null;
+            }
+
+            function handleDragOver(e) {
+                const hasFiles = e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+                if (hasFiles) {
+                    e.preventDefault();
+                }
+            }
+
+            function handleDrop(e) {
+                const files = e.dataTransfer && e.dataTransfer.files;
+                if (!files || !files.length) return;
+                e.preventDefault();
+                const target = findMainAudioInput();
+                if (!target) return;
+                const dt = new DataTransfer();
+                Array.from(files).forEach(f => dt.items.add(f));
+                target.files = dt.files;
+                target.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+
+            w.addEventListener('dragover', handleDragOver);
+            w.addEventListener('drop', handleDrop);
+            w.__whispertc_global_drop_bound = true;
+        })();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
     if uploaded is not None:
         uploaded_name = uploaded.name
 
@@ -1279,26 +1331,60 @@ if not IS_WORKER:
     # 初始化狀態
     transcribing = st.session_state.get("transcribing", False)
 
-    # 加入防誤關閉提示（以 markdown 注入 script，避免 iframe 佔位；無論轉寫狀態皆啟用）
-    st.markdown(
-        """
+    # 加入防誤關閉提示（用 components.html 注入，避免 markdown 腳本被忽略）
+    # 只在轉寫中啟用，結束後解除，避免長期干擾
+    from streamlit import components
+    components.v1.html(
+        f"""
         <script>
-        (function() {
+        (function() {{
             const msg = '轉寫尚未完成，確定要離開嗎？';
-            const w = window.parent || window;
-            if (!w.__whispertc_onbeforeunload) {
-                const handler = function(e) {
-                    e.preventDefault();
-                    e.returnValue = msg;
-                    return msg;
-                };
-                w.__whispertc_onbeforeunload = handler;
-                w.onbeforeunload = handler;
-            }
-        })();
+            const shouldEnable = {str(bool(transcribing)).lower()};
+            function getTargetWindow() {{
+                try {{
+                    if (window.top && window.top !== window) return window.top;
+                }} catch (e) {{}}
+                try {{
+                    if (window.parent && window.parent !== window) return window.parent;
+                }} catch (e) {{}}
+                return window;
+            }}
+            function handler(e) {{
+                e.preventDefault();
+                e.returnValue = msg;
+                return msg;
+            }}
+            const w = getTargetWindow();
+            if (shouldEnable) {{
+                if (!w.__whispertc_onbeforeunload) {{
+                    w.__whispertc_onbeforeunload = handler;
+                    w.addEventListener('beforeunload', w.__whispertc_onbeforeunload, {{ capture: true }});
+                    w.onbeforeunload = w.__whispertc_onbeforeunload;
+                }}
+                if (!w.__whispertc_beforeunload_tick) {{
+                    w.__whispertc_beforeunload_tick = setInterval(() => {{
+                        if (!w.__whispertc_onbeforeunload) {{
+                            w.__whispertc_onbeforeunload = handler;
+                            w.addEventListener('beforeunload', w.__whispertc_onbeforeunload, {{ capture: true }});
+                            w.onbeforeunload = w.__whispertc_onbeforeunload;
+                        }}
+                    }}, 1500);
+                }}
+            }} else {{
+                if (w.__whispertc_beforeunload_tick) {{
+                    clearInterval(w.__whispertc_beforeunload_tick);
+                    w.__whispertc_beforeunload_tick = null;
+                }}
+                if (w.__whispertc_onbeforeunload) {{
+                    w.removeEventListener('beforeunload', w.__whispertc_onbeforeunload, {{ capture: true }});
+                    w.onbeforeunload = null;
+                    w.__whispertc_onbeforeunload = null;
+                }}
+            }}
+        }})();
         </script>
         """,
-        unsafe_allow_html=True,
+        height=0,
     )
 
     # 顯示灰化樣式 + 禁用游標
