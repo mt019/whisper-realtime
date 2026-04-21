@@ -806,4 +806,3 @@
  Thanks for watching!
 撤了 撤了
  Thanks for watching!
-(.venv311) iw@idebijixingdiannao whisper-realtime % 
