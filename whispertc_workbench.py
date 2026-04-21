@@ -3,7 +3,7 @@ import streamlit as st
 from faster_whisper import WhisperModel
 from opencc import OpenCC
 from pydub import AudioSegment
-import io, os, time, wave, math, json, hashlib
+import io, os, time, wave, math, json, hashlib, subprocess, shutil
 import re
 from typing import List, Tuple, Dict, Any, Pattern
 from dataclasses import dataclass
@@ -53,6 +53,21 @@ def _load_defaults_config() -> Dict[str, Any]:
 
 DEFAULTS_CONFIG = _load_defaults_config()
 
+WHISPERCPP_DEFAULT_CLI = str(DEFAULTS_CONFIG.get("whispercpp_cli", "") or os.environ.get("WHISPERCPP_CLI", ""))
+WHISPERCPP_DEFAULT_MODEL = str(DEFAULTS_CONFIG.get("whispercpp_model", "") or os.environ.get("WHISPERCPP_MODEL", ""))
+WHISPERCPP_COMMON_DIRS = [
+    Path.home() / "Documents" / "whisper.cpp",
+    Path.home() / "whisper.cpp",
+    Path("/opt/homebrew/opt/whisper-cpp"),
+]
+WHISPERCPP_OPTIMAL_MODEL_NAMES = (
+    "ggml-medium-q5_0.bin",
+    "ggml-medium-q8_0.bin",
+    "ggml-medium.bin",
+    "ggml-small-q8_0.bin",
+    "ggml-small.bin",
+)
+
 DOMAIN_SECRET_KEY = DEFAULTS_CONFIG.get("domain_secret_key", "domain_kb_paths")
 DEFAULT_DOMAIN_PATHS = [str(Path(p).expanduser()) for p in DEFAULTS_CONFIG.get("domain_paths", [])]
 DOMAIN_ALLOWED_SUFFIXES = set(DEFAULTS_CONFIG.get("allowed_suffixes", [".pdf", ".md", ".txt"]))
@@ -95,11 +110,23 @@ def _extract_regex_correction_map(cfg: Dict[str, Any]) -> List[Tuple[str, str]]:
     mapping: List[Tuple[str, str]] = []
     raw_map = cfg.get("regex_correction_map", {})
     if isinstance(raw_map, dict):
-        for pattern, replacement in raw_map.items():
-            p = (str(pattern) if pattern is not None else "").strip()
-            r = (str(replacement) if replacement is not None else "").strip()
-            if p and r:
-                mapping.append((p, r))
+        # Prefer consistent schema with correction_map: {"correct": ["regex1", ...]}
+        if all(isinstance(v, (list, tuple, set)) for v in raw_map.values()):
+            for correct, patterns in raw_map.items():
+                replacement = (str(correct) if correct is not None else "").strip()
+                if not replacement:
+                    continue
+                for pattern in patterns:
+                    p = (str(pattern) if pattern is not None else "").strip()
+                    if p:
+                        mapping.append((p, replacement))
+        else:
+            # Backward compatibility: {"pattern": "replacement"}
+            for pattern, replacement in raw_map.items():
+                p = (str(pattern) if pattern is not None else "").strip()
+                r = (str(replacement) if replacement is not None else "").strip()
+                if p and r:
+                    mapping.append((p, r))
     return mapping
 
 
@@ -220,6 +247,47 @@ CORRECTION_MAP: Dict[str, str] = {}
 REGEX_CORRECTION_RULES: List[Tuple[Pattern[str], str]] = []
 
 
+def _detect_whispercpp_cli() -> str:
+    for name in ("whisper-cli", "main"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for base in WHISPERCPP_COMMON_DIRS:
+        for rel in ("build/bin/whisper-cli", "build/bin/main", "main"):
+            cand = base / rel
+            if cand.exists():
+                return str(cand)
+    return ""
+
+
+def _detect_whispercpp_model() -> str:
+    for base in WHISPERCPP_COMMON_DIRS:
+        model_dir = base / "models"
+        for name in WHISPERCPP_OPTIMAL_MODEL_NAMES:
+            cand = model_dir / name
+            if cand.exists():
+                return str(cand)
+        if model_dir.exists():
+            candidates = sorted(
+                list(model_dir.glob("ggml-*.bin")) + list(model_dir.glob("*.gguf")),
+                key=lambda p: p.stat().st_size if p.exists() else 0,
+            )
+            if candidates:
+                return str(candidates[0])
+    return ""
+
+
+def _is_whispercpp_optimal(cli_path: str, model_path: str, backend: str, beam: int) -> bool:
+    if backend != "whisper.cpp":
+        return False
+    if not cli_path or not Path(str(cli_path)).expanduser().exists():
+        return False
+    if not model_path or not Path(str(model_path)).expanduser().exists():
+        return False
+    model_name = Path(str(model_path)).name
+    return model_name in WHISPERCPP_OPTIMAL_MODEL_NAMES and int(beam or 0) == 1
+
+
 def _normalize_paths(paths: List[str]) -> Tuple[str, ...]:
     normalized = []
     for p in paths:
@@ -255,11 +323,21 @@ def _load_corrections_from_paths(
                 if isinstance(data, dict):
                     raw_regex_map = data.get("regex_correction_map")
                     if isinstance(raw_regex_map, dict):
-                        for pattern, replacement in raw_regex_map.items():
-                            pat = (str(pattern) if pattern is not None else "").strip()
-                            rep = (str(replacement) if replacement is not None else "").strip()
-                            if pat and rep:
-                                regex_corrections.append((pat, rep))
+                        if all(isinstance(v, (list, tuple, set)) for v in raw_regex_map.values()):
+                            for correct, patterns in raw_regex_map.items():
+                                replacement = (str(correct) if correct is not None else "").strip()
+                                if not replacement:
+                                    continue
+                                for pattern in patterns:
+                                    pat = (str(pattern) if pattern is not None else "").strip()
+                                    if pat:
+                                        regex_corrections.append((pat, replacement))
+                        else:
+                            for pattern, replacement in raw_regex_map.items():
+                                pat = (str(pattern) if pattern is not None else "").strip()
+                                rep = (str(replacement) if replacement is not None else "").strip()
+                                if pat and rep:
+                                    regex_corrections.append((pat, rep))
                     if "correction_map" in data and isinstance(data.get("correction_map"), dict):
                         data = data.get("correction_map", {})
                     # Determine format: correct -> [wrongs] or wrong -> correct
@@ -419,6 +497,29 @@ if not IS_WORKER:
         [data-testid="stFileUploaderDropzone"][aria-label*="上傳音檔"] section {
             padding: 2rem !important;      /* increase padding inside dropzone */
         }
+        div[data-testid="stProgress"] {
+            padding-top: 0.15rem;
+            padding-bottom: 0.2rem;
+        }
+        div[data-testid="stProgress"] > div {
+            height: 0.72rem !important;
+            background-color: #ffe8ef !important;
+            border-radius: 999px !important;
+            overflow: hidden !important;
+        }
+        div[data-testid="stProgress"] > div > div {
+            height: 0.72rem !important;
+            background-color: #ff8fb3 !important;
+            border-radius: 999px !important;
+        }
+        div[data-testid="stProgress"] > div > div > div {
+            background-color: #ff8fb3 !important;
+            border-radius: 999px !important;
+        }
+        div[data-testid="stProgress"] p {
+            color: #8f4d63 !important;
+            font-weight: 600 !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -448,22 +549,60 @@ if not IS_WORKER:
 
 
     sidebar.markdown("---")
-    model_name = sidebar.selectbox("模型",
-        ["base","small","medium","distil-large-v3","large-v3"], index=2)
-    compute = sidebar.selectbox("精度", ["int8","float16","float32"], index=0)
-    beam_size = sidebar.selectbox("束搜尋大小", [1,2,4,5,8], index=1)
-    vad = sidebar.checkbox("啟用 VAD 過濾", True)
-    with sidebar.expander("VAD 靈敏度", expanded=False):
-        vad_threshold = st.slider("threshold", 0.05, 0.95, 0.50, 0.01)
-        vad_min_silence = st.slider("min_silence_duration_ms", 50, 1200, 250, 10)
-        vad_min_speech = st.slider("min_speech_duration_ms", 50, 800, 150, 10)
-        vad_pad = st.slider("speech_pad_ms", 0, 500, 200, 10)
-    punc_rule = sidebar.checkbox("依停頓自動補標點", True)
+    detected_whispercpp_cli = _detect_whispercpp_cli()
+    detected_whispercpp_model = _detect_whispercpp_model()
+    default_backend_idx = 1 if (WHISPERCPP_DEFAULT_CLI or detected_whispercpp_cli) else 0
+    asr_backend_options = ["faster-whisper", "whisper.cpp"]
+    asr_backend = asr_backend_options[default_backend_idx]
+    model_name = "small"
+    compute = "int8"
+    beam_size = 1
+    whispercpp_cli = WHISPERCPP_DEFAULT_CLI or detected_whispercpp_cli
+    whispercpp_model = WHISPERCPP_DEFAULT_MODEL or detected_whispercpp_model
+    whispercpp_threads = max(1, min(6, (os.cpu_count() or 4) - 2))
+    vad = True
+    vad_threshold = 0.50
+    vad_min_silence = 250
+    vad_min_speech = 150
+    vad_pad = 200
+    punc_rule = True
     default_punc = DEFAULT_PUNCTUATION_SETTINGS
-    with sidebar.expander("標點靈敏度", expanded=False):
-        comma_ms = st.slider("逗號門檻 (ms)", 80, 400, default_punc.comma_ms, 10)
-        period_ms = st.slider("句號門檻 (ms)", 120, 800, default_punc.period_ms, 10)
-        adaptive_check = st.checkbox("自適應門檻（依語速）", default_punc.adaptive)
+    comma_ms = default_punc.comma_ms
+    period_ms = default_punc.period_ms
+    adaptive_check = default_punc.adaptive
+    reflow_enable = False
+    reflow_width = 60
+    auto_chunk_audio = False
+    with sidebar.expander("進階設定", expanded=False):
+        asr_backend = st.selectbox("STT 後端", asr_backend_options, index=default_backend_idx)
+        if asr_backend == "faster-whisper":
+            model_name = st.selectbox("模型", ["base","small","medium","distil-large-v3","large-v3"], index=1)
+            compute = st.selectbox("精度", ["int8","float16","float32"], index=0)
+        beam_size = st.selectbox("束搜尋大小", [1,2,4,5,8], index=0)
+        if asr_backend == "whisper.cpp":
+            whispercpp_cli = st.text_input("CLI 路徑", whispercpp_cli)
+            whispercpp_model = st.text_input("模型檔路徑", whispercpp_model)
+            whispercpp_threads = st.slider("CPU threads", 1, max(1, os.cpu_count() or 8), min(whispercpp_threads, max(1, os.cpu_count() or 8)), 1)
+            st.caption("本機最佳性能：使用 Metal 編譯的 whisper.cpp；M3 Air 16GB 建議 medium-q5_0，beam=1。")
+            if _is_whispercpp_optimal(whispercpp_cli, whispercpp_model, asr_backend, beam_size):
+                st.success("最佳配置已啟用")
+            else:
+                st.warning("目前不是最佳配置；請使用 whisper.cpp、medium-q5_0、beam=1。")
+        vad = st.checkbox("啟用 VAD 過濾", vad)
+        with st.expander("VAD 靈敏度", expanded=False):
+            vad_threshold = st.slider("threshold", 0.05, 0.95, vad_threshold, 0.01)
+            vad_min_silence = st.slider("min_silence_duration_ms", 50, 1200, vad_min_silence, 10)
+            vad_min_speech = st.slider("min_speech_duration_ms", 50, 800, vad_min_speech, 10)
+            vad_pad = st.slider("speech_pad_ms", 0, 500, vad_pad, 10)
+        punc_rule = st.checkbox("依停頓自動補標點", punc_rule)
+        with st.expander("標點靈敏度", expanded=False):
+            comma_ms = st.slider("逗號門檻 (ms)", 80, 400, comma_ms, 10)
+            period_ms = st.slider("句號門檻 (ms)", 120, 800, period_ms, 10)
+            adaptive_check = st.checkbox("自適應門檻（依語速）", adaptive_check)
+        with st.expander("段落輸出", expanded=False):
+            reflow_enable = st.checkbox("依語境分段顯示", reflow_enable)
+            reflow_width = st.slider("每段最長字數", 20, 120, reflow_width, 5)
+        auto_chunk_audio = st.checkbox("長錄音自動分段轉寫", auto_chunk_audio)
     CURRENT_PUNCT_SETTINGS = PunctuationSettings(
         comma_ms=int(comma_ms),
         period_ms=int(period_ms),
@@ -471,11 +610,6 @@ if not IS_WORKER:
     )
     st.session_state["punctuation_settings"] = CURRENT_PUNCT_SETTINGS
 
-    with sidebar.expander("段落輸出", expanded=False):
-        reflow_enable = st.checkbox("依語境分段顯示", False)
-        reflow_width = st.slider("每段最長字數", 20, 120, 60, 5)
-    # 音檔是否切成多段處理（預設不切，避免額外錯誤風險）
-    auto_chunk_audio = sidebar.checkbox("長錄音自動分段轉寫", False)
     sidebar.markdown("---")
     sidebar.caption("可選：載入 PDF/MD/TXT 作為領域詞彙，增強辨識")
     if preset_domain_files:
@@ -541,6 +675,8 @@ def fmt_dur(sec: float) -> str:
 
 
 CJK_PUNCS = "，。、？！：；,.!?"
+SENTENCE_END_PUNCS = "。！？…!?．."
+ANY_END_PUNCS = "。！？，、；：…,.!?;:．"
 
 ZH_PUNC_MAP = str.maketrans({
     ",": "，",
@@ -560,6 +696,15 @@ def normalize_zh_punc(s: str) -> str:
     for p in "，。？！：；":
         s = s.replace(" " + p, p)
     return s
+
+
+def has_any_punctuation(s: str) -> bool:
+    return any(ch in CJK_PUNCS or ch in "、；：;:…" for ch in (s or ""))
+
+
+def has_terminal_punctuation(s: str) -> bool:
+    stripped = (s or "").rstrip()
+    return bool(stripped) and stripped[-1] in ANY_END_PUNCS
 
 # --- 簡易文本抽取與詞彙抽取 ---
 def _read_pdf_bytes(name: str, data: bytes) -> str:
@@ -735,7 +880,7 @@ def audio_info_from_bytes(b: bytes, filename: str|None=None) -> Tuple[AudioSegme
     return seg, dur
 
 def export_seg_to_wav(seg: AudioSegment, path: str):
-    seg.export(path, format="wav")  # 交給 ffmpeg
+    seg.set_channels(1).set_frame_rate(16000).set_sample_width(2).export(path, format="wav")
 
 def start_timecode(t: float) -> str:
     return time.strftime("%H:%M:%S", time.gmtime(max(t, 0))) + f",{int((t%1)*1000):03d}"
@@ -901,6 +1046,8 @@ class SmartPunctuator:
         last = self.tokens[-1].rstrip()
         if not last:
             return
+        if has_terminal_punctuation(last):
+            return
         last_tail = last[-1]
         if last_tail in "。！？" and punc in "。！？":
             return
@@ -1060,6 +1207,8 @@ class SmartPunctuator:
         - 若 gap <= 0：強制加逗號，避免句子緊接或重疊時無斷點。
         - 其他情況：交由 _decide_punc() 判斷句號／逗號。
         """
+        if self.tokens and has_terminal_punctuation(self.tokens[-1]):
+            return
         # 若 gap 為負或零（重疊、緊接），仍強制插入逗號
         if gap <= 0 and self.tokens:
             self._append_to_last("，")
@@ -1110,11 +1259,253 @@ class SmartPunctuator:
         last = self.tokens[-1].rstrip()
         if not last:
             return
-        if last[-1] in "。！？":
+        if has_terminal_punctuation(last):
             return
         self.tokens[-1] = last + self._choose_sentence_end()
         self._after_punc(self.tokens[-1][-1])
 
+
+
+def _read_srt_blocks(srt_text: str) -> List[Tuple[float, float, str]]:
+    blocks: List[Tuple[float, float, str]] = []
+    for raw_block in re.split(r"\n\s*\n", srt_text.strip()):
+        lines = [line.strip() for line in raw_block.splitlines() if line.strip()]
+        if len(lines) < 2:
+            continue
+        time_line = next((line for line in lines if "-->" in line), "")
+        if not time_line:
+            continue
+        try:
+            start_str, end_str = time_line.split("-->", 1)
+            start_sec = to_seconds(start_str.strip())
+            end_sec = to_seconds(end_str.strip())
+        except Exception:
+            start_sec, end_sec = 0.0, 0.0
+        text_idx = lines.index(time_line) + 1
+        text = " ".join(lines[text_idx:]).strip()
+        if text:
+            blocks.append((start_sec, end_sec, text))
+    return blocks
+
+
+_WHISPERCPP_SEGMENT_RE = re.compile(
+    r"^\[(\d{2}:\d{2}:\d{2}[,.]\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2}[,.]\d{3})\]\s*(.*)$"
+)
+
+
+def _parse_whispercpp_timecode(ts: str) -> float:
+    return to_seconds(ts.replace(".", ","))
+
+
+def _srt_blocks_to_srt(blocks: List[Tuple[float, float, str]], time_offset_sec: float = 0.0) -> str:
+    out: List[str] = []
+    for idx, (start, end, text) in enumerate(blocks, 1):
+        out.append(str(idx))
+        out.append(f"{start_timecode(start + time_offset_sec)} --> {start_timecode(end + time_offset_sec)}")
+        out.append(text)
+        out.append("")
+    return "\n".join(out)
+
+
+def _final_text_from_blocks(
+    blocks: List[Tuple[float, float, str]],
+    punc_rule: bool,
+    lexical_rules: LexicalRules | None,
+    punc_settings: PunctuationSettings | None,
+):
+    lexical_cfg = lexical_rules or LEXICAL_RULES
+    punctuation_cfg = punc_settings or CURRENT_PUNCT_SETTINGS
+    normalized_blocks = [
+        (start, end, normalize_zh_punc(apply_common_corrections(cc.convert(text).strip())))
+        for start, end, text in blocks
+        if text and text.strip()
+    ]
+    source_has_punctuation = any(has_any_punctuation(text) for _, _, text in normalized_blocks)
+
+    if punc_rule and not source_has_punctuation:
+        final_punc = SmartPunctuator(lexical_cfg)
+        for start, end, text in normalized_blocks:
+            if text:
+                final_punc.add_chunk(text, start, end, punctuation_cfg.comma_threshold, punctuation_cfg.period_threshold)
+        final_punc.ensure_terminal()
+        tokens_fixed = []
+        for token in final_punc.tokens:
+            token = token.rstrip()
+            if not token:
+                continue
+            if not has_terminal_punctuation(token):
+                token += "。"
+            tokens_fixed.append(token)
+        return normalize_zh_punc("\n".join(tokens_fixed))
+
+    joiner = "\n" if source_has_punctuation else ""
+    final_text = joiner.join(text for _, _, text in normalized_blocks)
+    if final_text and not has_terminal_punctuation(final_text):
+        final_text += "。"
+    return final_text
+
+
+def _resolve_whispercpp_cli(cli_path: str) -> str:
+    cli_path = (cli_path or "").strip()
+    if cli_path:
+        expanded = str(Path(cli_path).expanduser())
+        if Path(expanded).exists():
+            return expanded
+        found = shutil.which(cli_path)
+        if found:
+            return found
+    found = shutil.which("whisper-cli") or shutil.which("main")
+    if found:
+        return found
+    raise FileNotFoundError("找不到 whisper.cpp CLI。請填入 whisper-cli/main 的完整路徑。")
+
+
+@st.cache_data(show_spinner=False)
+def _whispercpp_cli_supports_arg(cli_path: str, arg: str) -> bool:
+    try:
+        result = subprocess.run([cli_path, "-h"], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return False
+    return arg in ((result.stdout or "") + (result.stderr or ""))
+
+
+def transcribe_one_whispercpp(
+    media_path: str,
+    cli_path: str,
+    model_path: str,
+    language: str,
+    beam_size: int,
+    initial_prompt: str | None,
+    punc_rule: bool,
+    ui_area,
+    progress_area,
+    stats_area,
+    threads: int,
+    time_offset_sec: float = 0.0,
+    total_sec_for_progress: float | None = None,
+    lexical_rules: LexicalRules | None = None,
+    punc_settings: PunctuationSettings | None = None,
+    progress_label: str = "whisper.cpp 轉寫中…",
+):
+    """Run whisper.cpp CLI and adapt its SRT output to the existing post-processing flow."""
+    live_box = ui_area.empty()
+    t0 = time.time()
+    total_sec = total_sec_for_progress or 1.0
+    prog = progress_area.progress(0.0, text=progress_label)
+
+    cli = _resolve_whispercpp_cli(cli_path)
+    model = str(Path(model_path).expanduser()) if model_path else ""
+    if not model or not Path(model).exists():
+        raise FileNotFoundError("找不到 whisper.cpp 模型檔。請填入 .bin/.gguf 模型完整路徑。")
+
+    out_prefix = str(Path(media_path).with_suffix("")) + "_whispercpp"
+    for stale in Path(media_path).parent.glob(Path(out_prefix).name + ".*"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+    cmd = [
+        cli,
+        "-m", model,
+        "-f", media_path,
+        "-l", language or "zh",
+        "-osrt",
+        "-of", out_prefix,
+        "-t", str(max(1, int(threads or 1))),
+        "-bs", str(max(1, int(beam_size or 1))),
+    ]
+    if _whispercpp_cli_supports_arg(cli, "-fa"):
+        cmd.append("-fa")
+    if initial_prompt:
+        cmd.extend(["--prompt", initial_prompt])
+
+    status_text = "正在載入模型…"
+    prog.progress(0.02, text=f"{status_text}｜耗時 00:00:00")
+    live_blocks: List[Tuple[float, float, str]] = []
+    log_tail: List[str] = []
+    saw_processing = False
+    last_prelude_update = 0.0
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.rstrip()
+        if not line:
+            continue
+        log_tail.append(line)
+        log_tail = log_tail[-40:]
+        match = _WHISPERCPP_SEGMENT_RE.match(line)
+        if not match:
+            if "processing" in line:
+                saw_processing = True
+                elapsed = time.time() - t0
+                prog.progress(0.06, text=f"正在轉寫…｜已轉錄音時長 00:00:00 / {fmt_dur(total_sec)}，耗時 {fmt_dur(elapsed)}")
+                last_prelude_update = time.time()
+            elif not live_blocks and time.time() - last_prelude_update > 3:
+                elapsed = time.time() - t0
+                prelude_progress = 0.05 if saw_processing else 0.03
+                label = "等待第一段文字…" if saw_processing else "正在載入模型…"
+                prog.progress(prelude_progress, text=f"{label}｜已轉錄音時長 00:00:00 / {fmt_dur(total_sec)}，耗時 {fmt_dur(elapsed)}")
+                last_prelude_update = time.time()
+            continue
+        start_sec = _parse_whispercpp_timecode(match.group(1))
+        end_sec = _parse_whispercpp_timecode(match.group(2))
+        text = normalize_zh_punc(apply_common_corrections(cc.convert(match.group(3).strip())))
+        if not text:
+            continue
+        live_blocks.append((start_sec, end_sec, text))
+        processed_sec = max(0.0, end_sec)
+        elapsed = time.time() - t0
+        eta_txt = ""
+        if processed_sec > 5 and elapsed > 2:
+            rate = processed_sec / max(elapsed, 1e-6)
+            remain_audio = max(0.0, total_sec - processed_sec)
+            est_remain = remain_audio / max(rate, 1e-6)
+            finish_ts = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(time.time() + est_remain)
+            )
+            eta_txt = f"｜預計剩餘 {fmt_dur(est_remain)}｜預計完成 {finish_ts}"
+        live_box.markdown("  \n".join(block_text for _, _, block_text in live_blocks))
+        prog.progress(
+            min(0.99, max(0.01, processed_sec / max(total_sec, 1e-6))),
+            text=f"已轉錄音時長 {fmt_dur(processed_sec)} / {fmt_dur(total_sec)}，耗時 {fmt_dur(elapsed)}{eta_txt}",
+        )
+    returncode = proc.wait()
+    if returncode != 0:
+        detail = "\n".join(log_tail).strip()
+        raise RuntimeError(f"whisper.cpp 轉寫失敗：{detail[-1200:]}")
+
+    srt_path = Path(out_prefix + ".srt")
+    if not srt_path.exists():
+        raise FileNotFoundError(f"whisper.cpp 沒有產生 SRT：{srt_path}")
+
+    raw_srt = srt_path.read_text(encoding="utf-8", errors="replace")
+    blocks = []
+    for start, end, text in _read_srt_blocks(raw_srt):
+        text = normalize_zh_punc(apply_common_corrections(cc.convert(text).strip()))
+        if text:
+            blocks.append((start, end, text))
+
+    live_box.markdown("  \n".join(text for _, _, text in blocks))
+    final_srt = _srt_blocks_to_srt(blocks, time_offset_sec=time_offset_sec)
+    final_text = _final_text_from_blocks(blocks, punc_rule, lexical_rules, punc_settings)
+
+    elapsed = time.time() - t0
+    processed_sec = max((end for _, end, _ in blocks), default=total_sec)
+    prog.progress(1.0, text=f"已轉錄音時長 {fmt_dur(processed_sec)} / {fmt_dur(total_sec)}，耗時 {fmt_dur(elapsed)}")
+    stats_area.info(f"已轉錄音時長：{fmt_dur(processed_sec)}；耗時：{fmt_dur(elapsed)}")
+
+    try:
+        srt_path.unlink()
+    except OSError:
+        pass
+    return final_text, final_srt, processed_sec, elapsed
 
 
 def transcribe_one(
@@ -1257,24 +1648,36 @@ def transcribe_one(
                 start_sec, end_sec = None, None
             srt_chunks.append((text_line, start_sec, end_sec))
 
-        # SmartPunctuator 補標點
-        for text, start, end in srt_chunks:
-            text = normalize_zh_punc(apply_common_corrections(text))
-            final_punc.add_chunk(text, start, end, punctuation_cfg.comma_threshold, punctuation_cfg.period_threshold)
+        normalized_chunks = [
+            (normalize_zh_punc(apply_common_corrections(text)), start, end)
+            for text, start, end in srt_chunks
+            if text and text.strip()
+        ]
+        source_has_punctuation = any(has_any_punctuation(text) for text, _, _ in normalized_chunks)
 
-        final_punc.ensure_terminal()
+        if source_has_punctuation:
+            tokens_fixed = []
+            for text, _, _ in normalized_chunks:
+                text = text.rstrip()
+                if text:
+                    tokens_fixed.append(text)
+            if tokens_fixed and not has_terminal_punctuation(tokens_fixed[-1]):
+                tokens_fixed[-1] += "。"
+        else:
+            # SmartPunctuator 補標點
+            for text, start, end in normalized_chunks:
+                final_punc.add_chunk(text, start, end, punctuation_cfg.comma_threshold, punctuation_cfg.period_threshold)
 
+            final_punc.ensure_terminal()
 
-        # ✅ 智能補標點：只有「無任何終止符」時才補句號
-        tokens_fixed = []
-        for t in final_punc.tokens:
-            t = t.rstrip()
-            if not t:
-                continue
-            # 若末尾已有任意標點符號（包含逗號、頓號、冒號等），則不重複補句號
-            if t[-1] not in "。！？…，、；：":
-                t += "。"
-            tokens_fixed.append(t)
+            tokens_fixed = []
+            for t in final_punc.tokens:
+                t = t.rstrip()
+                if not t:
+                    continue
+                if not has_terminal_punctuation(t):
+                    t += "。"
+                tokens_fixed.append(t)
 
 
 
@@ -1369,69 +1772,12 @@ if not IS_WORKER:
     # 顯示/下載區
     status = st.empty()
     top_info = st.empty()
-    live_cols = st.columns(2)
 
 
     # === 顯示模式控制（放在整合顯示區最上面） ===
 
     # 初始化狀態
     transcribing = st.session_state.get("transcribing", False)
-
-    # 加入防誤關閉提示（用 components.html 注入，避免 markdown 腳本被忽略）
-    # 只在轉寫中啟用，結束後解除，避免長期干擾
-    from streamlit import components
-    components.v1.html(
-        f"""
-        <script>
-        (function() {{
-            const msg = '轉寫尚未完成，確定要離開嗎？';
-            const shouldEnable = {str(bool(transcribing)).lower()};
-            function getTargetWindow() {{
-                try {{
-                    if (window.top && window.top !== window) return window.top;
-                }} catch (e) {{}}
-                try {{
-                    if (window.parent && window.parent !== window) return window.parent;
-                }} catch (e) {{}}
-                return window;
-            }}
-            function handler(e) {{
-                e.preventDefault();
-                e.returnValue = msg;
-                return msg;
-            }}
-            const w = getTargetWindow();
-            if (shouldEnable) {{
-                if (!w.__whispertc_onbeforeunload) {{
-                    w.__whispertc_onbeforeunload = handler;
-                    w.addEventListener('beforeunload', w.__whispertc_onbeforeunload, {{ capture: true }});
-                    w.onbeforeunload = w.__whispertc_onbeforeunload;
-                }}
-                if (!w.__whispertc_beforeunload_tick) {{
-                    w.__whispertc_beforeunload_tick = setInterval(() => {{
-                        if (!w.__whispertc_onbeforeunload) {{
-                            w.__whispertc_onbeforeunload = handler;
-                            w.addEventListener('beforeunload', w.__whispertc_onbeforeunload, {{ capture: true }});
-                            w.onbeforeunload = w.__whispertc_onbeforeunload;
-                        }}
-                    }}, 1500);
-                }}
-            }} else {{
-                if (w.__whispertc_beforeunload_tick) {{
-                    clearInterval(w.__whispertc_beforeunload_tick);
-                    w.__whispertc_beforeunload_tick = null;
-                }}
-                if (w.__whispertc_onbeforeunload) {{
-                    w.removeEventListener('beforeunload', w.__whispertc_onbeforeunload, {{ capture: true }});
-                    w.onbeforeunload = null;
-                    w.__whispertc_onbeforeunload = null;
-                }}
-            }}
-        }})();
-        </script>
-        """,
-        height=0,
-    )
 
     # 顯示灰化樣式 + 禁用游標
     st.markdown(
@@ -1441,6 +1787,10 @@ if not IS_WORKER:
             opacity: 0.4 !important;
             pointer-events: none !important;
             cursor: not-allowed !important;
+        }
+        div[data-testid="stIFrame"][height="0"],
+        iframe[height="0"] {
+            display: none !important;
         }
         </style>
         """,
@@ -1529,7 +1879,7 @@ if not IS_WORKER and st.session_state.get("start_transcribe_pending"):
 
     # 轉為單一 wav 檔（作為後續切段基礎）
     base_path = os.path.join(tmp_dir, f"_tmp_{ts}.wav")
-    export_seg_to_wav(seg.set_channels(1).set_frame_rate(44100).set_sample_width(2), base_path)
+    export_seg_to_wav(seg, base_path)
 
     # 構建初始提示（合併使用者提示與領域詞彙）
     combined_prompt = (init_prompt or "").strip()
@@ -1551,12 +1901,25 @@ if not IS_WORKER and st.session_state.get("start_transcribe_pending"):
                 st.code(domain_prompt_preview[:400] + ("…" if len(domain_prompt_preview) > 400 else ""))
 
     # 載入模型
-    status.info(f"載入模型：{model_name} / {compute} / beam={beam_size}")
-    st.session_state["transcribe_status_message"] = f"載入模型：{model_name} / {compute} / beam={beam_size}"
-    model = load_model(model_name, compute)
+    if asr_backend == "whisper.cpp":
+        if not _is_whispercpp_optimal(whispercpp_cli, whispercpp_model, asr_backend, beam_size):
+            st.error("STT 未使用最佳配置。請確認後端為 whisper.cpp、模型為 medium-q5_0 或 medium、beam=1。")
+            st.session_state["transcribing"] = False
+            st.session_state["start_transcribe_pending"] = False
+            st.session_state["transcribe_status_message"] = ""
+            if "run_button_primary" in st.session_state:
+                del st.session_state["run_button_primary"]
+            st.stop()
+        status.info(f"準備 whisper.cpp：{Path(whispercpp_model).name if whispercpp_model else '尚未指定模型'} / beam={beam_size}")
+        st.session_state["transcribe_status_message"] = f"準備 whisper.cpp / beam={beam_size}"
+        model = None
+    else:
+        status.info(f"載入模型：{model_name} / {compute} / beam={beam_size}")
+        st.session_state["transcribe_status_message"] = f"載入模型：{model_name} / {compute} / beam={beam_size}"
+        model = load_model(model_name, compute)
 
     # === 切段與並行策略 ===
-    device_now = st.session_state.get("device_used", "cpu")
+    device_now = "whisper.cpp" if asr_backend == "whisper.cpp" else st.session_state.get("device_used", "cpu")
     overlap = 5.0
 
     def make_chunks(total_s: float, k: int):
@@ -1595,7 +1958,10 @@ if not IS_WORKER and st.session_state.get("start_transcribe_pending"):
         export_seg_to_wav(seg[a*1000:b*1000], p)
         chunk_paths.append((p,a,b))
 
-    device_msg = f"裝置：{device_now}；切段 {k}（含 {overlap}s 重疊）；並行：否"
+    if k == 1:
+        device_msg = f"裝置：{device_now}；整段轉寫；並行：否"
+    else:
+        device_msg = f"裝置：{device_now}；切段 {k}（含 {overlap}s 重疊）；並行：否"
     combined_status = f"{device_msg}｜📝 正在轉錄音檔…"
     status.info(combined_status)
     st.session_state["transcribe_status_message"] = combined_status
@@ -1611,20 +1977,40 @@ if not IS_WORKER and st.session_state.get("start_transcribe_pending"):
             one_stats = st.empty()
         progress_area = realtime_progress_area
         seg_start_ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        st.caption(f"分段 1 開始轉換時間點：{seg_start_ts}")
+        st.caption(f"開始轉換時間點：{seg_start_ts}")
         status.info("開始轉寫…")
         st.session_state["transcribe_status_message"] = "開始轉寫…"
-        final_text, final_srt, _, elapsed = transcribe_one(
-            os.path.join(tmp_dir, f"_tmp_{ts}_1.wav"), model,
-            language="zh", vad_filter=vad, beam_size=beam_size,
-            initial_prompt=combined_prompt, punc_rule=punc_rule,
-            vad_parameters=vad_params,
-            ui_area=one_live, progress_area=progress_area, stats_area=one_stats,
-            time_offset_sec=chunks[0][0], total_sec_for_progress=(chunks[0][1]-chunks[0][0]),
-            lexical_rules=LEXICAL_RULES,
-            punc_settings=CURRENT_PUNCT_SETTINGS,
-            progress_label="轉寫中…",
-        )
+        if asr_backend == "whisper.cpp":
+            final_text, final_srt, _, elapsed = transcribe_one_whispercpp(
+                os.path.join(tmp_dir, f"_tmp_{ts}_1.wav"),
+                cli_path=whispercpp_cli,
+                model_path=whispercpp_model,
+                language="zh",
+                beam_size=beam_size,
+                initial_prompt=combined_prompt,
+                punc_rule=punc_rule,
+                ui_area=one_live,
+                progress_area=progress_area,
+                stats_area=one_stats,
+                threads=whispercpp_threads,
+                time_offset_sec=chunks[0][0],
+                total_sec_for_progress=(chunks[0][1]-chunks[0][0]),
+                lexical_rules=LEXICAL_RULES,
+                punc_settings=CURRENT_PUNCT_SETTINGS,
+                progress_label="whisper.cpp 轉寫中…",
+            )
+        else:
+            final_text, final_srt, _, elapsed = transcribe_one(
+                os.path.join(tmp_dir, f"_tmp_{ts}_1.wav"), model,
+                language="zh", vad_filter=vad, beam_size=beam_size,
+                initial_prompt=combined_prompt, punc_rule=punc_rule,
+                vad_parameters=vad_params,
+                ui_area=one_live, progress_area=progress_area, stats_area=one_stats,
+                time_offset_sec=chunks[0][0], total_sec_for_progress=(chunks[0][1]-chunks[0][0]),
+                lexical_rules=LEXICAL_RULES,
+                punc_settings=CURRENT_PUNCT_SETTINGS,
+                progress_label="轉寫中…",
+            )
         total_elapsed = elapsed
         final_texts.append(final_text)
         final_srts.append(final_srt)
@@ -1639,15 +2025,34 @@ if not IS_WORKER and st.session_state.get("start_transcribe_pending"):
             seg_start_ts = time.strftime("%Y-%m-%d %H:%M:%S")
             st.caption(f"分段 {i} 開始轉換時間點：{seg_start_ts}")
             part_live = st.empty(); part_prog = st.empty(); part_stats = st.empty()
-            text_i, srt_i, _, _ = transcribe_one(
-                p, model, language="zh", vad_filter=vad, beam_size=beam_size,
-                initial_prompt=combined_prompt, punc_rule=punc_rule,
-                vad_parameters=vad_params,
-                ui_area=part_live, progress_area=part_prog, stats_area=part_stats,
-                time_offset_sec=a, total_sec_for_progress=(b-a),
-                lexical_rules=LEXICAL_RULES,
-                punc_settings=CURRENT_PUNCT_SETTINGS,
-            )
+            if asr_backend == "whisper.cpp":
+                text_i, srt_i, _, _ = transcribe_one_whispercpp(
+                    p,
+                    cli_path=whispercpp_cli,
+                    model_path=whispercpp_model,
+                    language="zh",
+                    beam_size=beam_size,
+                    initial_prompt=combined_prompt,
+                    punc_rule=punc_rule,
+                    ui_area=part_live,
+                    progress_area=part_prog,
+                    stats_area=part_stats,
+                    threads=whispercpp_threads,
+                    time_offset_sec=a,
+                    total_sec_for_progress=(b-a),
+                    lexical_rules=LEXICAL_RULES,
+                    punc_settings=CURRENT_PUNCT_SETTINGS,
+                )
+            else:
+                text_i, srt_i, _, _ = transcribe_one(
+                    p, model, language="zh", vad_filter=vad, beam_size=beam_size,
+                    initial_prompt=combined_prompt, punc_rule=punc_rule,
+                    vad_parameters=vad_params,
+                    ui_area=part_live, progress_area=part_prog, stats_area=part_stats,
+                    time_offset_sec=a, total_sec_for_progress=(b-a),
+                    lexical_rules=LEXICAL_RULES,
+                    punc_settings=CURRENT_PUNCT_SETTINGS,
+                )
             final_texts.append(text_i)
             final_srts.append(srt_i)
             span_done += (b - a)
