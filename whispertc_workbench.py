@@ -91,7 +91,20 @@ def _extract_correction_map(cfg: Dict[str, Any]) -> Dict[str, str]:
     return mapping
 
 
+def _extract_regex_correction_map(cfg: Dict[str, Any]) -> List[Tuple[str, str]]:
+    mapping: List[Tuple[str, str]] = []
+    raw_map = cfg.get("regex_correction_map", {})
+    if isinstance(raw_map, dict):
+        for pattern, replacement in raw_map.items():
+            p = (str(pattern) if pattern is not None else "").strip()
+            r = (str(replacement) if replacement is not None else "").strip()
+            if p and r:
+                mapping.append((p, r))
+    return mapping
+
+
 DEFAULT_CORRECTION_MAP = _extract_correction_map(DEFAULTS_CONFIG)
+DEFAULT_REGEX_CORRECTION_MAP = _extract_regex_correction_map(DEFAULTS_CONFIG)
 
 
 @dataclass(frozen=True)
@@ -204,6 +217,7 @@ preset_domain_files: List[StaticDomainFile] = []
 preset_domain_paths: List[str] = []
 combined_domain_files: List = []
 CORRECTION_MAP: Dict[str, str] = {}
+REGEX_CORRECTION_RULES: List[Tuple[Pattern[str], str]] = []
 
 
 def _normalize_paths(paths: List[str]) -> Tuple[str, ...]:
@@ -224,8 +238,13 @@ def _normalize_paths(paths: List[str]) -> Tuple[str, ...]:
 
 
 @st.cache_data(show_spinner=False)
-def _load_corrections_from_paths(paths: Tuple[str, ...], base_mapping: Dict[str, str]) -> Dict[str, str]:
+def _load_corrections_from_paths(
+    paths: Tuple[str, ...],
+    base_mapping: Dict[str, str],
+    base_regex_mapping: Tuple[Tuple[str, str], ...],
+) -> Tuple[Dict[str, str], List[Tuple[str, str]]]:
     corrections: Dict[str, str] = dict(base_mapping)
+    regex_corrections: List[Tuple[str, str]] = list(base_regex_mapping)
     for p in paths:
         file_path = Path(p)
         if not file_path.exists() or not file_path.is_file():
@@ -234,6 +253,15 @@ def _load_corrections_from_paths(paths: Tuple[str, ...], base_mapping: Dict[str,
             if file_path.suffix.lower() == ".json":
                 data = json.loads(file_path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
+                    raw_regex_map = data.get("regex_correction_map")
+                    if isinstance(raw_regex_map, dict):
+                        for pattern, replacement in raw_regex_map.items():
+                            pat = (str(pattern) if pattern is not None else "").strip()
+                            rep = (str(replacement) if replacement is not None else "").strip()
+                            if pat and rep:
+                                regex_corrections.append((pat, rep))
+                    if "correction_map" in data and isinstance(data.get("correction_map"), dict):
+                        data = data.get("correction_map", {})
                     # Determine format: correct -> [wrongs] or wrong -> correct
                     if all(isinstance(v, (list, tuple, set)) for v in data.values()):
                         for correct, wrongs in data.items():
@@ -292,10 +320,20 @@ def _load_corrections_from_paths(paths: Tuple[str, ...], base_mapping: Dict[str,
             wrong, right = parts[0].strip(), parts[1].strip()
             if wrong and right:
                 corrections[wrong] = right
-    return corrections
+    return corrections, regex_corrections
 
 
-def _resolve_corrections(domain_dirs: Tuple[str, ...]) -> Dict[str, str]:
+def _compile_regex_correction_rules(rules: List[Tuple[str, str]]) -> List[Tuple[Pattern[str], str]]:
+    compiled: List[Tuple[Pattern[str], str]] = []
+    for pattern, replacement in rules:
+        try:
+            compiled.append((re.compile(pattern), replacement))
+        except re.error:
+            continue
+    return compiled
+
+
+def _resolve_corrections(domain_dirs: Tuple[str, ...]) -> Tuple[Dict[str, str], List[Tuple[Pattern[str], str]]]:
     try:
         raw_paths = st.secrets.get(CORRECTION_SECRET_KEY)
     except Exception:
@@ -307,15 +345,22 @@ def _resolve_corrections(domain_dirs: Tuple[str, ...]) -> Dict[str, str]:
         fallback.append(str(Path(d) / "common_corrections.txt"))
     candidate_paths.extend(fallback)
     normalized = _normalize_paths(candidate_paths)
-    return _load_corrections_from_paths(normalized, DEFAULT_CORRECTION_MAP)
+    corrections, regex_corrections = _load_corrections_from_paths(
+        normalized,
+        DEFAULT_CORRECTION_MAP,
+        tuple(DEFAULT_REGEX_CORRECTION_MAP),
+    )
+    return corrections, _compile_regex_correction_rules(regex_corrections)
 
 
 def apply_common_corrections(text: str) -> str:
-    if not text or not CORRECTION_MAP:
+    if not text or (not CORRECTION_MAP and not REGEX_CORRECTION_RULES):
         return text
     output = text
     for wrong, right in CORRECTION_MAP.items():
         output = output.replace(wrong, right)
+    for pattern, replacement in REGEX_CORRECTION_RULES:
+        output = pattern.sub(replacement, output)
     return output
 
 
@@ -352,7 +397,7 @@ if not IS_WORKER:
 
 if not IS_WORKER:
     preset_domain_files, preset_domain_paths = _resolve_default_domain_files()
-    CORRECTION_MAP = _resolve_corrections(tuple(preset_domain_paths))
+    CORRECTION_MAP, REGEX_CORRECTION_RULES = _resolve_corrections(tuple(preset_domain_paths))
     sidebar = st.sidebar
     sidebar.markdown(
         """
@@ -466,6 +511,7 @@ else:
     # Dummy values for workers (actual values passed as arguments)
     vad_params = {}
     CORRECTION_MAP = dict(DEFAULT_CORRECTION_MAP)
+    REGEX_CORRECTION_RULES = _compile_regex_correction_rules(DEFAULT_REGEX_CORRECTION_MAP)
     CURRENT_PUNCT_SETTINGS = DEFAULT_PUNCTUATION_SETTINGS
 
 
@@ -1641,6 +1687,18 @@ if not IS_WORKER and st.session_state.get("start_transcribe_pending"):
             f_txt.write(final_text)
         with open(srt_path, "w", encoding="utf-8") as f_srt:
             f_srt.write(final_srt)
+
+        # 清理同名的增量檔（base_時間戳.*），避免目錄內出現重複版本
+        for pattern in (f"{base_filename}_*.txt", f"{base_filename}_*.srt"):
+            for stale in Path(tmp_dir).glob(pattern):
+                stale_path = str(stale)
+                if stale_path in (txt_path, srt_path):
+                    continue
+                try:
+                    os.remove(stale_path)
+                except OSError:
+                    pass
+
         st.sidebar.success(f"已自動保存到本地：{txt_path} 和 {srt_path}")
 
 
