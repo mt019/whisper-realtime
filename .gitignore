@@ -13,3 +13,4 @@ _tmp_*.wav
 # Subtitle and text files
 *.srt
 *.txt
+Tang/*.m4a
