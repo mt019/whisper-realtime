@@ -1,9 +1,11 @@
 .venv/
 .venv311/
 __pycache__/
+.cache/
 .vscode/
 .DS_Store
 domain_terms_auto.json
+.streamlit/workbench.pid
 
 # Temporary audio files
 _tmp_*.wav
@@ -13,4 +15,6 @@ _tmp_*.wav
 # Subtitle and text files
 *.srt
 *.txt
+!requirements.txt
 Tang/*.m4a
+*.m4a

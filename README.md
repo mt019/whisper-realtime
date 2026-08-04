@@ -8,6 +8,7 @@ WhisperTC Workbench 是一個針對繁體中文調校的 Whisper 轉寫工作台
 - 即時調整模型與推理參數：在側邊欄選擇模型大小、計算精度、束搜尋大小、VAD 靈敏度，邊聽邊調。
 - 繁體中文最佳化：內建簡轉繁 (`OpenCC`)，搭配停頓式標點、自適應門檻，以及可選的「文本式標點融合」。
 - 領域知識提示：可上傳 PDF/MD/TXT，萃取關鍵詞當作提示，用來拉高專業術語的命中率。
+- 說話者辨識：可選用 `pyannote.audio` 對齊 SRT 時間軸；只有明確偵測到多位說話者時才在 TXT/SRT 加上「說話者 1/2」標籤。
 - 預設領域資料夾：可以在 Streamlit secrets 設定常用路徑，啟動時自動掛載（檔名含「稿」的會被自動略過）。
 - 常見勘誤自動更正：轉寫結果會套用自訂錯別字對照表，減少你在 TXT/SRT 裡逐字修正的時間。
 - 大檔案切段策略：可以選擇是否自動把長錄音切成數段並行處理；預設不切，優先降低潛在錯誤風險。
@@ -36,9 +37,17 @@ pip install -r requirements.txt
 ```
 
 `requirements.txt` 主要涵蓋：
-- `streamlit`、`faster-whisper`、`opencc-python-reimplemented`
-- `streamlit-webrtc`、`av`（音訊/視訊元件）
-- `numpy`, `numba`, `llvmlite`
+- `streamlit`、`opencc-python-reimplemented`
+- `pydub`、`pypdf`
+
+說話者辨識是可選功能，另外需要：
+
+```bash
+pip install pyannote.audio
+export HUGGINGFACE_TOKEN="hf_..."
+```
+
+第一次使用前，請到 Hugging Face 接受 `pyannote/speaker-diarization-3.1` 模型條款，然後在側邊欄勾選「辨識說話者」。如果沒有安裝或沒有 token，app 會略過說話者標籤並保留原本轉錄結果。
 
 ## 使用方式
 ```bash

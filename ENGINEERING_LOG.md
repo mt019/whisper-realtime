@@ -44,14 +44,15 @@
 ### UI Changes
 - Removed unused empty column layout that could create blank vertical space.
 - Removed the `beforeunload` iframe injection because it created a large blank region in the Streamlit page.
-- Moved rarely changed ASR internals into an advanced settings section so the normal transcription flow is not cluttered by backend, model path, precision, thread, VAD, punctuation threshold, or chunking controls.
+- Moved rarely changed ASR internals into an advanced settings section so the normal transcription flow is not cluttered by model path, thread, punctuation threshold, or chunking controls.
+- Removed the `faster-whisper` fallback from the Streamlit app; STT is now `whisper.cpp` only.
+- Removed the legacy `test.py` script that depended on `faster-whisper` and a hard-coded local audio file.
+- Trimmed Python dependencies for the cpp-only path.
+- Added global `*.m4a` ignore coverage so local audio source files do not get staged accidentally.
 - Simplified single-file mode wording:
   - uses "整段轉寫" instead of "分段 1"
   - uses "開始轉換時間點" instead of "分段 1 開始轉換時間點"
-- Progress bar styling changed to a bright pink UI:
-  - fill: `#ff8fb3`
-  - track: `#ffe8ef`
-  - text: `#8f4d63`
+- Progress bar styling was restored to Streamlit's default minimal version after the custom color treatment proved visually distracting.
 
 ### Punctuation Logic
 - Added punctuation helpers:
@@ -63,7 +64,7 @@
 
 ### Known Tradeoffs
 - `whisper.cpp` CLI live output is segment-level, not word-level.
-- `faster-whisper` still has a more convenient Python generator API for fine-grained streaming and word timestamps.
+- `faster-whisper` was removed from the app to keep the project on the Apple Silicon `whisper.cpp` path.
 - `beforeunload` protection was removed to avoid layout breakage; if needed, it should be reintroduced without a visible/space-occupying Streamlit component.
 
 ### Verification
